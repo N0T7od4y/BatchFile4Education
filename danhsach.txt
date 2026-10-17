@@ -1,0 +1,4 @@
+Google,https://www.google.com
+YouTube,https://www.youtube.com
+GitHub,https://github.com
+PyPI Requests,https://pypi.org/project/requests/
