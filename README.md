@@ -1,1 +1,1 @@
-Batch script every day, i think so 🕵️‍♂️🐧
+script every day, i think so 🕵️‍♂️🐧
