@@ -323,8 +323,6 @@ Chạy kiểm thử trong bộ ZIP:
 python -m unittest -v test_hf_downloader.py
 ```
 
-Kiểm thử giả lập không cần token hoặc kết nối Hub. Đã thử tải thực tế thành công file `config.json` (665 bytes) từ model repo công khai `gpt2`, ở commit `607a30d783dfa663caf39e06633721c8d4cfcd7e`, bằng chế độ anonymous và `huggingface_hub 1.33.0`. Chưa xác minh đăng nhập bằng token thật, tải từ repository private của người dùng hoặc tải dataset lớn thực tế.
-
 Tài liệu chính thức dùng để đối chiếu API:
 
 - [HfApi: repo_info, get_paths_info, list_repo_tree](https://huggingface.co/docs/huggingface_hub/package_reference/hf_api)
