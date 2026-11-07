@@ -5,7 +5,11 @@ from __future__ import annotations
 import argparse
 import fnmatch
 import getpass
+import json
 import os
+import time
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 import sys
 import threading
@@ -41,7 +45,13 @@ def parser_for_cli():
     p.add_argument('--exclude', action='append', default=[], help='Exclude glob; repeatable; wins over include')
     p.add_argument('--output', default='./downloaded_data', help='Local parent folder')
     p.add_argument('--workers', type=int, default=4, help='Parallel file downloads, >= 1')
-    p.add_argument('--retries', type=int, default=3, help='Extra attempts for transient network errors, >= 0')
+    p.add_argument('--retries', type=int, default=5, help='Extra retries for network/temporary file errors, >= 0')
+    p.add_argument('--rate-limit-retries', type=int, default=0,
+                   help='Maximum retries for HTTP 429; 0 = retry indefinitely (default)')
+    p.add_argument('--rate-limit-max-wait', type=int, default=180,
+                   help='Maximum seconds of waiting per 429, >= 1 (default: 180)')
+    p.add_argument('--error-log', default=None,
+                   help='JSONL path for failed files (default: OUTPUT_failed.jsonl beside OUTPUT)')
     p.add_argument('--dry-run', action='store_true', help='List selected files and bytes without downloading')
     p.add_argument('--force-download', action='store_true', help='Download again even when cached')
     auth = p.add_mutually_exclusive_group()
@@ -50,32 +60,102 @@ def parser_for_cli():
     return p
 
 
+def status_code(exc): # type: ignore
+    return getattr(getattr(exc, 'response', None), 'status_code', None)
+
+
 def error_label(exc):
-    # Do not print raw exceptions: signed URLs/credentials may appear in them.
-    status = getattr(getattr(exc, 'response', None), 'status_code', None)
-    return type(exc).__name__ + (f' (HTTP {status})' if status else '')
+    # Do not print raw exceptions: signed URLs or credentials may appear in them.
+    status = status_code(exc)
+    winerror = getattr(exc, 'winerror', None)
+    return type(exc).__name__ + (f' (HTTP {status})' if status else
+                                   f' (WinError {winerror})' if winerror else '')
 
 
 def transient(exc):
     import httpx
-    status = getattr(getattr(exc, 'response', None), 'status_code', None)
-    return isinstance(exc, (httpx.TransportError, TimeoutError, ConnectionError)) or status == 429 or (status is not None and 500 <= status <= 599)
+    status = status_code(exc)
+    return (
+        isinstance(exc, (httpx.TransportError, TimeoutError, ConnectionError, FileExistsError))
+        or getattr(exc, 'winerror', None) == 183
+        or status in (408, 425, 429)
+        or (status is not None and 500 <= status <= 599)
+    )
 
 
-def retry_call(func, retries, stop):
-    for attempt in range(retries + 1):
-        if stop.is_set():
-            raise InterruptedError('Stopped')
+def retry_after_seconds(exc):
+    response = getattr(exc, 'response', None)
+    headers = getattr(response, 'headers', None)
+    value = headers.get('Retry-After') if headers is not None else None
+    if not value:
+        return None
+    try:
+        return max(0.0, float(value))
+    except (TypeError, ValueError):
+        try:
+            when = parsedate_to_datetime(value)
+            if when.tzinfo is None:
+                when = when.replace(tzinfo=timezone.utc)
+            return max(0.0, (when - datetime.now(timezone.utc)).total_seconds())
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+
+class RateLimitGate:
+    """Shared waiting gate: a 429 pauses new requests from every worker."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._until = 0.0
+
+    def pause(self, seconds):
+        with self._lock:
+            self._until = max(self._until, time.monotonic() + seconds)
+
+    def wait(self, stop):
+        while True:
+            if stop.is_set():
+                raise InterruptedError('Stopped')
+            with self._lock:
+                remaining = self._until - time.monotonic()
+            if remaining <= 0:
+                return
+            if stop.wait(remaining):
+                raise InterruptedError('Stopped')
+
+
+def retry_call(func, retries, stop, gate, max_429=0, max_wait=180, context=''):
+    other_errors = rate_errors = 0
+    while True:
+        gate.wait(stop)
         try:
             return func()
         except Exception as exc:
-            if attempt == retries or not transient(exc):
+            if stop.is_set():
+                raise InterruptedError('Stopped') from exc
+
+            if status_code(exc) == 429:
+                rate_errors += 1
+                if max_429 and rate_errors > max_429:
+                    raise
+                # Retry-After (seconds/date) takes precedence over backoff.
+                suggested = retry_after_seconds(exc) or 0
+                seconds = min(max_wait, max(suggested, 5 * 2 ** min(rate_errors - 1, 6)))
+                gate.pause(seconds)
+                if rate_errors == 1 or rate_errors % 5 == 0:
+                    print(f'HTTP 429 (rate limit){": " + context if context else ""}: '
+                          f'cho {seconds:.0f}s, thu lai lan {rate_errors}...', flush=True)
+                continue
+
+            if not transient(exc) or other_errors >= retries:
                 raise
-            if stop.wait(min(2 ** attempt, 30)):
+            other_errors += 1
+            seconds = min(2 ** (other_errors - 1), 30)
+            if stop.wait(seconds):
                 raise InterruptedError('Stopped') from exc
 
 
-def authenticate(api, args, stop):
+def authenticate(api, args, stop, retry):
     from huggingface_hub import get_token, login
     if args.anonymous:
         print('Che do cong khai: khong gui token.')
@@ -83,7 +163,7 @@ def authenticate(api, args, stop):
     token = None if args.force_login else get_token()
     if token:
         try:
-            user = retry_call(lambda: api.whoami(token=token), args.retries, stop)
+            user = retry(lambda: api.whoami(token=token), context='whoami')
             print('Da dang nhap:', user.get('name', '(unknown)'))
             return token
         except Exception as exc:
@@ -98,15 +178,15 @@ def authenticate(api, args, stop):
     token = getpass.getpass('HF token: ').strip()
     if not token:
         raise SelectionError('Da huy dang nhap.')
-    user = retry_call(lambda: api.whoami(token=token), args.retries, stop)
+    user = retry(lambda: api.whoami(token=token), context='whoami')
     # Persist this token via the official API. Never store it in source or output.
-    retry_call(lambda: login(token=token, add_to_git_credential=False), args.retries, stop)
+    retry(lambda: login(token=token, add_to_git_credential=False), context='login')
     print('Dang nhap thanh cong:', user.get('name', '(unknown)'))
     # Pass the entered token explicitly; an old HF_TOKEN cannot override this run.
     return token
 
 
-def collect_files(api, args, token, commit, stop):
+def collect_files(api, args, token, commit, stop, retry):
     from huggingface_hub.hf_api import RepoFile, RepoFolder
     common = dict(repo_id=args.repo, repo_type=args.repo_type, revision=commit, token=token)
     found = {}
@@ -122,14 +202,15 @@ def collect_files(api, args, token, commit, stop):
             return
         if any(fnmatch.fnmatchcase(name, pat) for pat in args.exclude):
             return
+        is_new = name not in found
         found[name] = entry.size
-        if len(found) % 10000 == 0:
+        if is_new and len(found) % 10000 == 0:
             print(f'Dang lap danh sach: {len(found)} file...', flush=True)
 
     scanned = set()
     for kind, path in requests:
         if path:
-            entries = retry_call(lambda: api.get_paths_info(paths=[path], **common), args.retries, stop)
+            entries = retry(lambda: api.get_paths_info(paths=[path], **common), context='check ' + path)
             item = next((x for x in entries if x.path == path), None)
             if item is None:
                 raise SelectionError(f'Khong tim thay: {path}')
@@ -151,7 +232,7 @@ def collect_files(api, args, token, commit, stop):
                 if stop.is_set():
                     raise InterruptedError('Stopped')
                 add(entry)
-        retry_call(scan, args.retries, stop)
+        retry(scan, context='list ' + (path or '/'))
         scanned.add(path)
     return found
 
@@ -175,26 +256,73 @@ def local_target(output, name):
     return target
 
 
-def download_files(files, args, token, commit, output, stop):
+def download_files(files, args, token, commit, output, stop, retry, rejected=None):
     from huggingface_hub import hf_hub_download
     from tqdm.auto import tqdm
-    succeeded = failed = 0
+
+    rejected = rejected or {}
+    error_log = (Path(args.error_log).expanduser().resolve() if args.error_log
+                 else output.parent / (output.name + '_failed.jsonl'))
+    error_fp = None
+    try:
+        error_log.parent.mkdir(parents=True, exist_ok=True)
+        error_fp = error_log.open('w', encoding='utf-8')
+    except OSError as exc:
+        print('CANH BAO: Khong mo duoc error log: ' + error_label(exc), flush=True)
+
+    def log_failure(name, exc):
+        nonlocal error_fp
+        label = exc if isinstance(exc, str) else error_label(exc)
+        if error_fp is not None:
+            try:
+                error_fp.write(json.dumps({'path': name, 'error': label}, ensure_ascii=False) + '\n')
+                error_fp.flush()
+            except OSError:
+                print('CANH BAO: Khong ghi duoc error log.', flush=True)
+                error_fp.close()
+                error_fp = None
+
+    succeeded = skipped = 0
+    failed = len(rejected)
+    for name, reason in rejected.items():
+        print(f'SKIP: {name}: {reason}', flush=True)
+        log_failure(name, reason)
+
     iterator = iter(files.items())
 
     def download(item):
         name, expected_size = item
         target = local_target(output, name)
+
+        def valid_file():
+            return target.is_file() and (
+                expected_size is None or target.stat().st_size == expected_size
+            )
+
+        # Resume: an existing file matching the expected size needs no re-download.
+        if not args.force_download and valid_file():
+            return 'skipped'
+
         def fetch(force):
-            return hf_hub_download(repo_id=args.repo, repo_type=args.repo_type, revision=commit,
-                                   filename=name, local_dir=str(output), token=token,
-                                   force_download=force)
-        retry_call(lambda: fetch(args.force_download), args.retries, stop)
-        if not target.is_file() or target.stat().st_size != expected_size:
-            # A stale/local truncated file must not be counted as success.
-            retry_call(lambda: fetch(True), args.retries, stop)
-        if not target.is_file() or target.stat().st_size != expected_size:
+            try:
+                return hf_hub_download(
+                    repo_id=args.repo, repo_type=args.repo_type, revision=commit,
+                    filename=name, local_dir=str(output), token=token,
+                    force_download=force
+                )
+            except FileExistsError:
+                # Another process might have finished this file while we were downloading.
+                if valid_file():
+                    return str(target)
+                raise
+
+        retry(lambda: fetch(args.force_download), context=name)
+        if not valid_file():
+            # Incorrect/truncated download: try a fresh copy.
+            retry(lambda: fetch(True), context=name)
+        if not valid_file():
             raise OSError('Downloaded size mismatch')
-        return name
+        return 'downloaded'
 
     pool = ThreadPoolExecutor(max_workers=args.workers)
     pending = {}
@@ -203,38 +331,50 @@ def download_files(files, args, token, commit, output, stop):
             item = next(iterator, None)
             if item is not None:
                 pending[pool.submit(download, item)] = item[0]
+
         for _ in range(min(args.workers, len(files))):
             enqueue()
-        with tqdm(total=len(files), desc='Files', unit='file') as progress:
+        with tqdm(total=len(files) + len(rejected), initial=len(rejected),
+                  desc='Files', unit='file') as progress:
             while pending:
                 done, _ = wait(pending, timeout=0.5, return_when=FIRST_COMPLETED)
                 for future in done:
                     name = pending.pop(future)
                     try:
-                        future.result()
+                        result = future.result()
                         succeeded += 1
+                        if result == 'skipped':
+                            skipped += 1
                     except Exception as exc:
                         failed += 1
-                        tqdm.write(f'FAILED: {name}: {error_label(exc)}')
+                        tqdm.write(f'FAILED (bo qua): {name}: {error_label(exc)}')
+                        log_failure(name, exc)
                     progress.update(1)
                     enqueue()
     except KeyboardInterrupt:
         stop.set()
         for future in pending:
             future.cancel()
-        print('\nDang dung; cho cac ket noi dang chay ket thuc...', flush=True)
+        print('\\nDang dung; cho ket noi dang chay ket thuc...', flush=True)
         raise
     finally:
         pool.shutdown(wait=True, cancel_futures=True)
-    print(f'Ket qua: {succeeded} thanh cong, {failed} loi, tong {len(files)} file.')
+        if error_fp is not None:
+            error_fp.close()
+
+    print(f'KET QUA: {succeeded} thanh cong (trong do {skipped} da ton tai), '
+          f'{failed} loi, tong {len(files) + len(rejected)} file.')
+    print(f'Danh sach file loi: {error_log if error_log.exists() else "(khong ghi duoc)"}')
+    print('Chay lai cung lenh/output de thu lai cac file loi; file du kich thuoc se duoc bo qua.')
     return 1 if failed else 0
 
 
 def main(argv=None):
     p = parser_for_cli()
     args = p.parse_args(argv)
-    if args.workers < 1 or args.retries < 0:
-        p.error('--workers >= 1; --retries >= 0')
+    if (args.workers < 1 or args.retries < 0 or
+            args.rate_limit_retries < 0 or args.rate_limit_max_wait < 1):
+        p.error('--workers >= 1; --retries >= 0; --rate-limit-retries >= 0; --rate-limit-max-wait >= 1')
     if '://' in args.repo or args.repo.startswith('/') or len(args.repo.split('/')) > 2:
         p.error('--repo la ID, khong phai URL; vi du OWNER/NAME')
     selectors = args.folder or args.file or args.path
@@ -243,29 +383,42 @@ def main(argv=None):
     if not args.all and not selectors:
         p.error('Chon --all, --folder, --file hoac --path; xem --help')
     stop = threading.Event()
+    gate = RateLimitGate()
+
+    def retry(func, context=''):
+        return retry_call(func, args.retries, stop, gate,
+                          args.rate_limit_retries, args.rate_limit_max_wait, context)
+
     try:
         from huggingface_hub import HfApi
         api = HfApi()
-        token = authenticate(api, args, stop)
-        info = retry_call(lambda: api.repo_info(repo_id=args.repo, repo_type=args.repo_type,
-                                              revision=args.revision, token=token), args.retries, stop)
+        token = authenticate(api, args, stop, retry)
+        info = retry(lambda: api.repo_info(
+            repo_id=args.repo, repo_type=args.repo_type,
+            revision=args.revision, token=token
+        ), context='repo_info')
         commit = info.sha
         if not commit:
             raise SelectionError('Khong lay duoc commit; dung de tranh tai lan lon phien ban.')
         print(f'Repo: {args.repo} [{args.repo_type}] | commit: {commit}', flush=True)
         print('Dang liet ke file...', flush=True)
-        files = collect_files(api, args, token, commit, stop)
+        files = collect_files(api, args, token, commit, stop, retry)
         if not files:
             raise SelectionError('Khong co file phu hop. Kiem tra path/include/exclude/revision.')
         output = Path(args.output).expanduser().resolve()
         seen = set()
-        for name in files:
-            target = local_target(output, name)
-            key = os.path.normcase(str(target))
-            if key in seen:
-                raise SelectionError('Hai duong dan Hub trung nhau tren he thong file dich: ' + name)
-            seen.add(key)
-        total = sum(files.values())
+        valid_files, rejected = {}, {}
+        for name, size in files.items():
+            try:
+                target = local_target(output, name)
+                key = os.path.normcase(str(target))
+                if key in seen:
+                    raise SelectionError('Trung duong dan sau khi chuyen sang he thong file')
+                seen.add(key)
+                valid_files[name] = size
+            except (SelectionError, OSError, ValueError) as exc:
+                rejected[name] = str(exc) if isinstance(exc, SelectionError) else error_label(exc)
+        total = sum(size for size in files.values() if isinstance(size, int))
         print(f'Da chon: {len(files)} file, {total:,} bytes ({total / 1024**3:.3f} GiB).')
         print(f'Dich: {output}')
         print('Dung luong tren la tong file duoc chon, khong phai so byte con phai tai.')
@@ -274,7 +427,7 @@ def main(argv=None):
                 print(f'{size}\t{name}')
             return 0
         output.mkdir(parents=True, exist_ok=True)
-        return download_files(files, args, token, commit, output, stop)
+        return download_files(valid_files, args, token, commit, output, stop, retry, rejected)
     except ImportError as exc:
         print('Thieu dependency. Chay: python -m pip install -U "huggingface_hub>=1.0,<2"', file=sys.stderr)
         print(error_label(exc), file=sys.stderr)
